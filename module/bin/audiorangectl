@@ -1,0 +1,1003 @@
+#!/system/bin/sh
+
+SCRIPT_DIR=${0%/*}
+MODDIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)"
+[ -n "$MODDIR" ] || MODDIR="$SCRIPT_DIR/.."
+LIB="$MODDIR/common/audiorange-lib.sh"
+
+if [ ! -f "$LIB" ]; then
+    echo "Ошибка: не найден общий файл логики: $LIB" >&2
+    exit 1
+fi
+. "$LIB"
+
+usage() {
+    cat <<'EOF_USAGE'
+AudioRange v1.0.0-beta.1 Beta · Lolokeksu
+
+Использование:
+  audiorange                 показать состояние
+  audiorange stock           использовать штатную шкалу прошивки
+  audiorange 30|50|75|100    выбрать профиль, если он не отклонён текущей прошивкой
+  audiorange 60              проверить пользовательские 60 шагов (15–100)
+  audiorange doctor          проверить работу модуля
+  audiorange check           проверить целостность файлов
+  audiorange fix             восстановить конфигурацию и права
+  audiorange conflicts       показать источники конфликтов
+  audiorange baseline        сохранить штатный диапазон в штатном профиле
+  audiorange report          вывести технический отчёт с fingerprint прошивки
+  audiorange history [число] показать историю, максимум 200 строк
+  audiorange test 25         безопасно проверить уровень 25%
+  audiorange restore         немедленно вернуть исходную громкость
+
+Короткие псевдонимы:
+  s — status, d — doctor, c — check, f — fix, x — conflicts,
+  b — baseline, p — report, h — history, t — test, r — restore.
+EOF_USAGE
+}
+
+
+ui_yes_no() {
+    [ "$1" = "1" ] && printf '%s' "да" || printf '%s' "нет"
+}
+
+ui_profile() {
+    profile="$1"
+    custom="$2"
+    case "$profile" in
+        stock) printf '%s' "Штатный профиль" ;;
+        custom) printf '%s' "Пользовательский: $custom шагов" ;;
+        *) printf '%s' "$profile шагов" ;;
+    esac
+}
+
+ui_verification() {
+    code="$1"
+    expected="$2"
+    prop="$3"
+    amin="$4"
+    amax="$5"
+    case "$code" in
+        CONFIRMED) printf '%s' "профиль подтверждён системным аудиосервисом" ;;
+        STOCK_ACTIVE) printf '%s' "активен штатный диапазон $amin–$amax" ;;
+        REBOOT_REQUIRED) printf '%s' "профиль сохранён и ожидает перезагрузки" ;;
+        PROPERTY_ONLY) printf '%s' "свойство применено, но диапазон аудиосервиса не прочитан" ;;
+        STOCK_UNVERIFIED) printf '%s' "штатный профиль активен, но диапазон аудиосервиса не прочитан" ;;
+        PROPERTY_MISMATCH) printf '%s' "системное свойство $prop не совпадает с выбранным значением $expected" ;;
+        AUDIOSERVICE_MISMATCH) printf '%s' "аудиосервис использует максимум $amax вместо $expected" ;;
+        *) printf '%s' "состояние не распознано: $code" ;;
+    esac
+}
+
+ui_recommendation() {
+    code="$1"
+    case "$code" in
+        CONFIRMED|STOCK_ACTIVE) printf '%s' "ничего делать не нужно" ;;
+        REBOOT_REQUIRED) printf '%s' "перезагрузите Android" ;;
+        PROPERTY_ONLY|STOCK_UNVERIFIED) printf '%s' "после полной загрузки выполните audiorange doctor" ;;
+        PROPERTY_MISMATCH) printf '%s' "проверьте audiorange conflicts, затем выполните audiorange fix" ;;
+        AUDIOSERVICE_MISMATCH) printf '%s' "проверьте конфликты и ограничения прошивки" ;;
+        *) printf '%s' "выполните audiorange doctor" ;;
+    esac
+}
+
+ui_baseline() {
+    state="$1"
+    maximum="$2"
+    case "$state" in
+        valid) printf '%s' "сохранён: максимум $maximum" ;;
+        stale) printf '%s' "устарел после смены прошивки" ;;
+        missing) printf '%s' "не сохранён" ;;
+        *) printf '%s' "состояние неизвестно" ;;
+    esac
+}
+
+ui_integrity() {
+    case "$1" in
+        VERIFIED) printf '%s' "подтверждена" ;;
+        MODIFIED) printf '%s' "есть изменённые или повреждённые файлы" ;;
+        not_checked|'') printf '%s' "ещё не проверялась" ;;
+        *) printf '%s' "состояние неизвестно" ;;
+    esac
+}
+
+ui_recovery() {
+    value="$1"
+    case "$value" in
+        clear|'') printf '%s' "не требовалось" ;;
+        restored_*_index_*)
+            index="${value##*_index_}"
+            printf '%s' "исходный уровень $index восстановлен"
+            ;;
+        failed_*) printf '%s' "не удалось восстановить; выполните audiorange restore" ;;
+        *) printf '%s' "$value" ;;
+    esac
+}
+
+ui_backend() {
+    backend="$1"
+    confidence="$2"
+    case "$backend" in
+        cmd_media_session) label="cmd media_session" ;;
+        unavailable) label="недоступен" ;;
+        *) label="$backend" ;;
+    esac
+    case "$confidence" in
+        high) certainty="высокая достоверность" ;;
+        medium) certainty="средняя достоверность" ;;
+        *) certainty="без подтверждения" ;;
+    esac
+    printf '%s' "$label · $certainty"
+}
+
+ui_rom_confidence() {
+    case "$1" in
+        high) printf '%s' "высокая" ;;
+        medium) printf '%s' "средняя" ;;
+        *) printf '%s' "ориентировочная" ;;
+    esac
+}
+
+ui_early_apply() {
+    result="$1"
+    target="$2"
+    current="$3"
+    case "$result" in
+        applied)
+            [ "$current" = "1" ] && printf '%s' "выполнено до Android-сервисов: $target" || printf '%s' "есть результат предыдущей загрузки: $target"
+            ;;
+        stock_skipped) printf '%s' "не требуется для штатного профиля" ;;
+        resetprop_missing) printf '%s' "resetprop недоступен" ;;
+        resetprop_failed) printf '%s' "resetprop завершился ошибкой" ;;
+        property_mismatch) printf '%s' "свойство не подтвердилось после resetprop" ;;
+        invalid_value) printf '%s' "отклонено недопустимое значение" ;;
+        *) printf '%s' "результат текущей загрузки отсутствует" ;;
+    esac
+}
+
+
+ui_compat_limit() {
+    value="$1"
+    source="$2"
+    if ar_is_uint "$value"; then
+        printf '%s' "$value шагов · $(ar_compat_source_text "$source")"
+    else
+        printf '%s' "неизвестен · требуется проверка выбранного профиля"
+    fi
+}
+
+ui_compat_values() {
+    value="$1"
+    [ -n "$value" ] && printf '%s' "$value" || printf '%s' "нет"
+}
+
+ui_compat_profile_state() {
+    case "$1" in
+        confirmed) printf '%s' "подтверждён AudioService" ;;
+        known_supported) printf '%s' "разрешён точным правилом прошивки; требуется runtime-подтверждение" ;;
+        blocked) printf '%s' "выше известного OEM-предела" ;;
+        rejected) printf '%s' "ранее отклонён этой прошивкой" ;;
+        untested) printf '%s' "ещё не проверен на этой прошивке" ;;
+        *) printf '%s' "состояние неизвестно" ;;
+    esac
+}
+
+load_status() {
+    ar_ensure_config
+    PROFILE="$(ar_cfg_get profile)"
+    CUSTOM="$(ar_cfg_get custom_steps)"
+    PENDING="$(ar_cfg_get pending_reboot)"
+    FAILURES="$(ar_cfg_get verification_failures)"
+    LAST_VERIFIED_BUILD="$(ar_cfg_get last_verified_build)"
+    EXPECTED="$(ar_profile_steps "$PROFILE" "$CUSTOM")"
+    [ -n "$EXPECTED" ] || EXPECTED="stock"
+    PROP="$(ar_prop_value)"
+    if ar_audio_probe; then :; fi
+    AUDIO_CURRENT="${AR_AUDIO_CURRENT:-unknown}"
+    AUDIO_MIN="${AR_AUDIO_MIN:-unknown}"
+    AUDIO_MAX="${AR_AUDIO_MAX:-unknown}"
+    AUDIO_BACKEND="${AR_AUDIO_BACKEND:-unavailable}"
+    AUDIO_CONFIDENCE="${AR_AUDIO_CONFIDENCE:-none}"
+    VERIFY="$(ar_verification "$PROFILE" "$CUSTOM" "$PENDING" "$PROP" "$AUDIO_MAX")"
+    ROOT_MANAGER="$(ar_root_manager)"
+    ar_rom_detect
+    ROM_FAMILY="$AR_ROM_FAMILY"
+    ROM_NAME="$AR_ROM_NAME"
+    ROM_VERSION="$AR_ROM_VERSION"
+    ROM_CONFIDENCE="$AR_ROM_CONFIDENCE"
+    ROM_NOTICE="$AR_ROM_NOTICE"
+    ROM_SCOPE="$AR_ROM_SCOPE"
+    ROM_OUTSIDE="$AR_ROM_OUTSIDE"
+    ANDROID_API="$(ar_android_api)"
+    ANDROID_NAME="$(ar_android_name "$ANDROID_API")"
+    if ar_android_supported "$ANDROID_API"; then ANDROID_SUPPORTED=true; else ANDROID_SUPPORTED=false; fi
+    CONFLICT_TMP="$AR_DATA_DIR/.conflicts.status.$$"
+    ar_conflicts_scan > "$CONFLICT_TMP"
+    rm -f "$CONFLICT_TMP"
+    CONFLICT_COUNT="${AR_CONFLICT_COUNT:-0}"
+    CONFLICT_HIGH="${AR_CONFLICT_HIGH:-0}"
+    CONFLICT_MEDIUM="${AR_CONFLICT_MEDIUM:-0}"
+    CONFLICT_LOW="${AR_CONFLICT_LOW:-0}"
+    BASELINE_STATE="$(ar_baseline_state)"
+    BASELINE_MAX="$(ar_baseline_max)"
+    TEST_ACTIVE="$(ar_test_active)"
+    TEST_REMAINING="$(ar_test_remaining)"
+    TEST_RECOVERY="$(ar_state_get last_test_recovery)"
+    [ -n "$TEST_RECOVERY" ] || TEST_RECOVERY="clear"
+    INTEGRITY="$(ar_state_get integrity)"
+    [ -n "$INTEGRITY" ] || INTEGRITY="not_checked"
+    EARLY_RESULT="$(ar_early_get result)"
+    EARLY_TARGET="$(ar_early_get target)"
+    EARLY_AFTER="$(ar_early_get property_after)"
+    EARLY_BOOT_ID="$(ar_early_get boot_id)"
+    CURRENT_BOOT_ID="$(ar_boot_id)"
+    [ -n "$EARLY_RESULT" ] || EARLY_RESULT="missing"
+    [ -n "$EARLY_TARGET" ] || EARLY_TARGET="unknown"
+    [ -n "$EARLY_AFTER" ] || EARLY_AFTER="unknown"
+    if [ "$EARLY_BOOT_ID" != "unknown" ] && [ "$EARLY_BOOT_ID" = "$CURRENT_BOOT_ID" ]; then EARLY_CURRENT=1; else EARLY_CURRENT=0; fi
+    CURRENT_BUILD="$(ar_build_id)"
+    ar_compat_prepare
+    COMPAT_BUILD="$(ar_compat_get build)"
+    COMPAT_STOCK_MAX="$(ar_compat_get stock_max)"
+    COMPAT_KNOWN_MAX="$(ar_compat_get known_max)"
+    COMPAT_SOURCE="$(ar_compat_get source)"
+    COMPAT_CONFIRMED="$(ar_compat_get confirmed_values)"
+    COMPAT_REJECTED="$(ar_compat_get rejected_values)"
+    COMPAT_LAST_REQUESTED="$(ar_compat_get last_requested)"
+    COMPAT_LAST_OBSERVED="$(ar_compat_get last_observed)"
+    COMPAT_NOTE="$(ar_compat_get note)"
+    COMPAT_CONFIRMED_MAX="$(ar_csv_max "$COMPAT_CONFIRMED")"
+    if [ "$PROFILE" = "stock" ]; then COMPAT_ACTIVE_STATE="stock"; else COMPAT_ACTIVE_STATE="$(ar_compat_profile_state "$EXPECTED")"; fi
+    PROFILE30_STATE="$(ar_compat_profile_state 30)"
+    PROFILE50_STATE="$(ar_compat_profile_state 50)"
+    PROFILE75_STATE="$(ar_compat_profile_state 75)"
+    PROFILE100_STATE="$(ar_compat_profile_state 100)"
+    if [ "$LAST_VERIFIED_BUILD" != "unknown" ] && [ "$LAST_VERIFIED_BUILD" != "$CURRENT_BUILD" ]; then
+        FIRMWARE_CHANGED=1
+    else
+        FIRMWARE_CHANGED=0
+    fi
+}
+
+cmd_status() {
+    load_status
+    profile_text="$(ui_profile "$PROFILE" "$CUSTOM")"
+    verify_text="$(ui_verification "$VERIFY" "$EXPECTED" "$PROP" "$AUDIO_MIN" "$AUDIO_MAX")"
+    recommendation="$(ui_recommendation "$VERIFY")"
+    baseline_text="$(ui_baseline "$BASELINE_STATE" "$BASELINE_MAX")"
+    integrity_text="$(ui_integrity "$INTEGRITY")"
+    recovery_text="$(ui_recovery "$TEST_RECOVERY")"
+    backend_text="$(ui_backend "$AUDIO_BACKEND" "$AUDIO_CONFIDENCE")"
+    early_text="$(ui_early_apply "$EARLY_RESULT" "$EARLY_TARGET" "$EARLY_CURRENT")"
+    if [ "$PROP" = "unset" ]; then property_text="не переопределено модулем"; else property_text="$PROP"; fi
+    if ar_is_uint "$AUDIO_MIN" && ar_is_uint "$AUDIO_MAX"; then range_text="$AUDIO_MIN–$AUDIO_MAX"; else range_text="не удалось прочитать"; fi
+    if [ "$ROM_VERSION" = "unknown" ]; then rom_text="$ROM_NAME"; else rom_text="$ROM_NAME · $ROM_VERSION"; fi
+    if [ "$TEST_ACTIVE" = "1" ]; then test_text="активен, осталось ${TEST_REMAINING} с"; else test_text="не активен"; fi
+
+    cat <<EOF_STATUS
+AudioRange $AR_VERSION · Lolokeksu
+
+Система
+  Устройство:          $(getprop ro.product.model) ($(getprop ro.product.device))
+  Android:             $ANDROID_NAME / API $ANDROID_API
+  Оболочка:            $rom_text
+  Точность определения: $(ui_rom_confidence "$ROM_CONFIDENCE")
+  Root-менеджер:       $ROOT_MANAGER
+
+Шкала мультимедиа
+  Выбранный профиль:   $profile_text
+  Системное свойство:  $property_text
+  Диапазон AudioService: $range_text
+  Текущий индекс:      $AUDIO_CURRENT
+  Метод проверки:      $backend_text
+
+Контроль состояния
+  Результат:           $verify_text
+  Нужна перезагрузка:  $(ui_yes_no "$PENDING")
+  Штатный диапазон:    $baseline_text
+  Целостность файлов:  $integrity_text
+  Раннее применение:    $early_text
+  Конфликты:           критические $CONFLICT_HIGH · динамические $CONFLICT_MEDIUM · совпадения $CONFLICT_LOW
+  Безопасный тест:     $test_text
+  Восстановление теста: $recovery_text
+  Прошивка изменилась: $(ui_yes_no "$FIRMWARE_CHANGED")
+
+Совместимость прошивки
+  Известный OEM-предел: $(ui_compat_limit "$COMPAT_KNOWN_MAX" "$COMPAT_SOURCE")
+  Штатный максимум:    ${COMPAT_STOCK_MAX:-unknown}
+  Подтверждено:        $(ui_compat_values "$COMPAT_CONFIRMED")
+  Отклонено:           $(ui_compat_values "$COMPAT_REJECTED")
+  Текущий профиль:     $( [ "$PROFILE" = "stock" ] && printf "штатный" || ui_compat_profile_state "$COMPAT_ACTIVE_STATE" )
+  Примечание:          $COMPAT_NOTE
+
+Границы действия
+  Изменяется:          $ROM_SCOPE
+  Не изменяется:       $ROM_OUTSIDE
+  Примечание:          $ROM_NOTICE
+
+Итог: $verify_text.
+Следующее действие: $recommendation.
+EOF_STATUS
+}
+
+
+cmd_web_status() {
+    load_status
+    printf '{'
+    printf '"version":"%s",' "$(ar_json_escape "$AR_VERSION")"
+    printf '"author":"Lolokeksu",'
+    printf '"rootManager":"%s",' "$(ar_json_escape "$ROOT_MANAGER")"
+    printf '"android":"%s",' "$(ar_json_escape "$(getprop ro.build.version.release)")"
+    printf '"api":"%s",' "$(ar_json_escape "$ANDROID_API")"
+    printf '"androidName":"%s",' "$(ar_json_escape "$ANDROID_NAME")"
+    printf '"androidSupported":%s,' "$ANDROID_SUPPORTED"
+    printf '"supportedApi":"33–36",'
+    printf '"model":"%s",' "$(ar_json_escape "$(getprop ro.product.model)")"
+    printf '"device":"%s",' "$(ar_json_escape "$(getprop ro.product.device)")"
+    printf '"romFamily":"%s",' "$(ar_json_escape "$ROM_FAMILY")"
+    printf '"romName":"%s",' "$(ar_json_escape "$ROM_NAME")"
+    printf '"romVersion":"%s",' "$(ar_json_escape "$ROM_VERSION")"
+    printf '"romConfidence":"%s",' "$(ar_json_escape "$ROM_CONFIDENCE")"
+    printf '"romNotice":"%s",' "$(ar_json_escape "$ROM_NOTICE")"
+    printf '"romScope":"%s",' "$(ar_json_escape "$ROM_SCOPE")"
+    printf '"romOutside":"%s",' "$(ar_json_escape "$ROM_OUTSIDE")"
+    printf '"profile":"%s",' "$(ar_json_escape "$PROFILE")"
+    printf '"custom":"%s",' "$(ar_json_escape "$CUSTOM")"
+    printf '"configured":"%s",' "$(ar_json_escape "$EXPECTED")"
+    printf '"property":"%s",' "$(ar_json_escape "$PROP")"
+    printf '"audioMin":"%s",' "$(ar_json_escape "$AUDIO_MIN")"
+    printf '"audioMax":"%s",' "$(ar_json_escape "$AUDIO_MAX")"
+    printf '"audioCurrent":"%s",' "$(ar_json_escape "$AUDIO_CURRENT")"
+    printf '"audioBackend":"%s",' "$(ar_json_escape "$AUDIO_BACKEND")"
+    printf '"audioConfidence":"%s",' "$(ar_json_escape "$AUDIO_CONFIDENCE")"
+    printf '"verification":"%s",' "$(ar_json_escape "$VERIFY")"
+    printf '"pendingReboot":%s,' "$PENDING"
+    printf '"baselineState":"%s",' "$(ar_json_escape "$BASELINE_STATE")"
+    printf '"baselineMax":"%s",' "$(ar_json_escape "$BASELINE_MAX")"
+    printf '"integrity":"%s",' "$(ar_json_escape "$INTEGRITY")"
+    printf '"earlyResult":"%s",' "$(ar_json_escape "$EARLY_RESULT")"
+    printf '"earlyTarget":"%s",' "$(ar_json_escape "$EARLY_TARGET")"
+    printf '"earlyAfter":"%s",' "$(ar_json_escape "$EARLY_AFTER")"
+    printf '"earlyCurrentBoot":%s,' "$EARLY_CURRENT"
+    printf '"conflicts":%s,' "$CONFLICT_COUNT"
+    printf '"conflictHigh":%s,' "$CONFLICT_HIGH"
+    printf '"conflictMedium":%s,' "$CONFLICT_MEDIUM"
+    printf '"conflictLow":%s,' "$CONFLICT_LOW"
+    printf '"testActive":%s,' "$TEST_ACTIVE"
+    printf '"testRemaining":%s,' "$TEST_REMAINING"
+    printf '"testRecovery":"%s",' "$(ar_json_escape "$TEST_RECOVERY")"
+    printf '"compatKnownMax":"%s",' "$(ar_json_escape "$COMPAT_KNOWN_MAX")"
+    printf '"compatStockMax":"%s",' "$(ar_json_escape "$COMPAT_STOCK_MAX")"
+    printf '"compatSource":"%s",' "$(ar_json_escape "$COMPAT_SOURCE")"
+    printf '"compatConfirmed":"%s",' "$(ar_json_escape "$COMPAT_CONFIRMED")"
+    printf '"compatRejected":"%s",' "$(ar_json_escape "$COMPAT_REJECTED")"
+    printf '"compatConfirmedMax":"%s",' "$(ar_json_escape "$COMPAT_CONFIRMED_MAX")"
+    printf '"compatActiveState":"%s",' "$(ar_json_escape "$COMPAT_ACTIVE_STATE")"
+    printf '"compatNote":"%s",' "$(ar_json_escape "$COMPAT_NOTE")"
+    printf '"profile30State":"%s",' "$(ar_json_escape "$PROFILE30_STATE")"
+    printf '"profile50State":"%s",' "$(ar_json_escape "$PROFILE50_STATE")"
+    printf '"profile75State":"%s",' "$(ar_json_escape "$PROFILE75_STATE")"
+    printf '"profile100State":"%s",' "$(ar_json_escape "$PROFILE100_STATE")"
+    printf '"firmwareChanged":%s' "$FIRMWARE_CHANGED"
+    printf '}\n'
+}
+
+cmd_set() {
+    requested="$1"
+    custom_arg="${2:-}"
+    ar_valid_profile "$requested" || { echo "Ошибка: неизвестный профиль «$requested»." >&2; return 2; }
+    if [ "$requested" = "custom" ]; then
+        ar_valid_custom "$custom_arg" || { echo "Ошибка: пользовательское значение должно быть целым числом от $AR_CUSTOM_MIN до $AR_CUSTOM_MAX." >&2; return 2; }
+    fi
+    ar_lock_acquire || { echo "Ошибка: конфигурация занята другой операцией." >&2; return 3; }
+    trap 'ar_lock_release' EXIT INT TERM
+    ar_ensure_config
+    old_profile="$(ar_cfg_get profile)"
+    old_custom="$(ar_cfg_get custom_steps)"
+    last_confirmed="$(ar_cfg_get last_confirmed)"
+    failures="$(ar_cfg_get verification_failures)"
+    verified_build="$(ar_cfg_get last_verified_build)"
+    [ -n "$last_confirmed" ] || last_confirmed="unknown"
+    ar_is_uint "$failures" || failures=0
+    [ -n "$verified_build" ] || verified_build="unknown"
+    if [ "$requested" = "custom" ]; then
+        new_custom="$custom_arg"
+        applied="$custom_arg"
+    else
+        new_custom="$old_custom"
+        [ -n "$new_custom" ] || new_custom="$AR_DEFAULT_CUSTOM"
+        applied="$requested"
+    fi
+
+    if [ "$requested" != "stock" ]; then
+        ar_compat_prepare
+        compat_state="$(ar_compat_profile_state "$applied")"
+        compat_limit="$(ar_compat_get known_max)"
+        case "$compat_state" in
+            blocked)
+                ar_lock_release
+                trap - EXIT INT TERM
+                echo "Ошибка: $applied шагов выше подтверждённого OEM-предела ${compat_limit} для этой точной прошивки." >&2
+                echo "Выберите значение не выше $compat_limit или штатный профиль." >&2
+                return 5
+                ;;
+            rejected)
+                ar_lock_release
+                trap - EXIT INT TERM
+                echo "Ошибка: профиль $applied уже был отклонён AudioService на этой прошивке." >&2
+                echo "После обновления прошивки запись совместимости сбросится автоматически." >&2
+                return 5
+                ;;
+        esac
+    else
+        compat_state="stock"
+    fi
+
+    old_pending="$(ar_cfg_get pending_reboot)"
+    same_profile=0
+    if [ "$requested" = "$old_profile" ]; then
+        if [ "$requested" != "custom" ] || [ "$new_custom" = "$old_custom" ]; then
+            same_profile=1
+        fi
+    fi
+    expected_tmp="$AR_DATA_DIR/.system.prop.same.$$"
+    ar_system_prop_content "$requested" "$new_custom" > "$expected_tmp"
+    prop_file_matches=0
+    cmp -s "$expected_tmp" "$AR_SYSTEM_PROP" 2>/dev/null && prop_file_matches=1
+    rm -f "$expected_tmp"
+
+    if [ "$same_profile" -eq 1 ] && [ "$prop_file_matches" -eq 1 ]; then
+        if [ "$old_pending" = "1" ]; then
+            ar_lock_release
+            trap - EXIT INT TERM
+            echo "Профиль уже сохранён: $(ui_profile "$requested" "$new_custom")."
+            echo "Следующее действие: перезагрузите Android для применения."
+            return 0
+        fi
+        prop_now="$(ar_prop_value)"
+        if ar_audio_probe; then audio_now="$AR_AUDIO_MAX"; else audio_now="unknown"; fi
+        verify_now="$(ar_verification "$requested" "$new_custom" 0 "$prop_now" "$audio_now")"
+        case "$verify_now" in
+            CONFIRMED|STOCK_ACTIVE)
+                ar_history "profile unchanged profile=$requested custom=$new_custom result=$verify_now source=${AR_SOURCE:-cli}"
+                ar_lock_release
+                trap - EXIT INT TERM
+                echo "Профиль уже активен: $(ui_profile "$requested" "$new_custom")."
+                echo "Изменения и перезагрузка не требуются."
+                return 0
+                ;;
+            PROPERTY_ONLY|STOCK_UNVERIFIED)
+                ar_history "profile unchanged profile=$requested custom=$new_custom result=$verify_now source=${AR_SOURCE:-cli}"
+                ar_lock_release
+                trap - EXIT INT TERM
+                echo "Профиль уже сохранён: $(ui_profile "$requested" "$new_custom")."
+                echo "Файлы изменять не требуется, но AudioService сейчас не подтвердил фактический диапазон."
+                echo "Следующее действие: после полной загрузки выполните su -c audiorange doctor."
+                return 0
+                ;;
+        esac
+    fi
+
+    ar_render_system_prop "$requested" "$new_custom" || { echo "Ошибка: не удалось обновить system.prop." >&2; return 4; }
+    ar_write_config "$requested" "$new_custom" 1 "$applied" "$last_confirmed" "reboot_required" "$failures" "$verified_build" || { echo "Ошибка: не удалось сохранить конфигурацию." >&2; return 4; }
+    ar_history "profile $old_profile/$old_custom -> $requested/$new_custom source=${AR_SOURCE:-cli} reboot_required=1"
+    ar_update_description "REBOOT_REQUIRED" "$requested" "$applied" "pending"
+    ar_lock_release
+    trap - EXIT INT TERM
+    echo "Выбран профиль: $(ui_profile "$requested" "$new_custom")"
+    if [ "$requested" != "stock" ]; then
+        echo "Статус для текущей прошивки: $(ui_compat_profile_state "$compat_state")."
+    fi
+    echo "Файл system.prop обновлён. До перезагрузки Android использует прежний диапазон."
+    echo "Следующее действие: su -c reboot"
+}
+
+
+
+cmd_conflicts() {
+    ar_init_dirs
+    conflicts_view="$AR_DATA_DIR/.conflicts.view.$$"
+    ar_conflicts_scan > "$conflicts_view"
+    echo "Проверка конфликтов"
+    echo "  Критические:  ${AR_CONFLICT_HIGH:-0}"
+    echo "  Динамические: ${AR_CONFLICT_MEDIUM:-0}"
+    echo "  Совпадения:   ${AR_CONFLICT_LOW:-0}"
+    echo
+    if [ ! -s "$conflicts_view" ]; then
+        echo "Активных определений свойства в других модулях и root-скриптах не найдено."
+    else
+        cat "$conflicts_view"
+        echo
+        echo "КРИТИЧЕСКИЙ требует устранения; ДИНАМИЧЕСКИЙ нужно проверить вручную; СОВПАДЕНИЕ обычно безвредно."
+    fi
+    rm -f "$conflicts_view"
+}
+
+
+cmd_history() {
+    lines="${1:-20}"
+    ar_is_uint "$lines" || lines=20
+    [ "$lines" -ge 1 ] 2>/dev/null || lines=20
+    [ "$lines" -le 200 ] 2>/dev/null || lines=200
+    if [ -f "$AR_HISTORY" ]; then
+        echo "Последние события: $lines"
+        tail -n "$lines" "$AR_HISTORY"
+    else
+        echo "История пока пуста."
+    fi
+}
+
+
+cmd_self_check() {
+    check_failures=0
+    check_warnings=0
+    tmp="$AR_DATA_DIR/.integrity.$$"
+    ar_init_dirs
+    echo "Проверка целостности AudioRange"
+    echo
+    manifest_status=0
+    ar_verify_manifest > "$tmp" || manifest_status=$?
+    if [ "$manifest_status" -ne 0 ]; then
+        manifest_failures="${AR_MANIFEST_FAILURES:-1}"
+        check_failures=$((check_failures + manifest_failures))
+    fi
+    sed 's/^\[OK\]/[OK]/; s/^\[FAIL\]/[ОШИБКА]/' "$tmp"
+    rm -f "$tmp"
+
+    ar_ensure_config
+    profile="$(ar_cfg_get profile)"
+    custom="$(ar_cfg_get custom_steps)"
+    if ar_valid_profile "$profile" && ar_valid_custom "$custom"; then echo "[OK] конфигурация корректна"; else echo "[ОШИБКА] конфигурация содержит недопустимые значения"; check_failures=$((check_failures + 1)); fi
+    compat_before_valid=0
+    if ar_compat_file_valid && [ "$(ar_compat_get build)" = "$(ar_build_id)" ]; then
+        compat_before_valid=1
+    fi
+    ar_compat_prepare
+    if ar_compat_file_valid && [ "$(ar_compat_get build)" = "$(ar_build_id)" ]; then
+        if [ "$compat_before_valid" -eq 1 ]; then
+            echo "[OK] база совместимости привязана к текущей прошивке"
+        else
+            echo "[ПРЕДУПРЕЖДЕНИЕ] база совместимости была пересоздана для текущей прошивки"
+            check_warnings=$((check_warnings + 1))
+        fi
+    else
+        echo "[ОШИБКА] база совместимости повреждена или относится к другой прошивке"
+        check_failures=$((check_failures + 1))
+    fi
+
+    expected_tmp="$AR_DATA_DIR/.system.prop.expected.$$"
+    ar_system_prop_content "$profile" "$custom" > "$expected_tmp"
+    if cmp -s "$expected_tmp" "$AR_SYSTEM_PROP" 2>/dev/null; then echo "[OK] system.prop соответствует профилю"; else echo "[ОШИБКА] system.prop не соответствует профилю"; check_failures=$((check_failures + 1)); fi
+    rm -f "$expected_tmp"
+
+    if grep -q '/data/adb/modules/audiorange/bin/audiorangectl' "$MODDIR/system/bin/audiorange" 2>/dev/null; then echo "[OK] упакованная команда audiorange направлена на контроллер"; else echo "[ОШИБКА] неверная цель упакованной команды audiorange"; check_failures=$((check_failures + 1)); fi
+    for file in post-fs-data.sh service.sh action.sh uninstall.sh bin/audiorangectl system/bin/audiorange; do
+        first="$(head -n 1 "$MODDIR/$file" 2>/dev/null)"
+        [ "$first" = '#!/system/bin/sh' ] && echo "[OK] заголовок $file" || { echo "[ОШИБКА] заголовок $file"; check_failures=$((check_failures + 1)); }
+    done
+    [ -x "$MODDIR/post-fs-data.sh" ] && echo "[OK] ранний загрузочный скрипт исполняемый" || { echo "[ОШИБКА] неверные права post-fs-data.sh"; check_failures=$((check_failures + 1)); }
+    [ -x "$MODDIR/bin/audiorangectl" ] && echo "[OK] контроллер исполняемый" || { echo "[ОШИБКА] неверные права контроллера"; check_failures=$((check_failures + 1)); }
+    [ -x "$MODDIR/system/bin/audiorange" ] && echo "[OK] упакованная команда audiorange исполняемая" || { echo "[ОШИБКА] неверные права упакованной команды audiorange"; check_failures=$((check_failures + 1)); }
+    runtime_cli="$(ar_runtime_cli_path 2>/dev/null)"
+    if [ -n "$runtime_cli" ] && grep -q '/data/adb/modules/audiorange/bin/audiorangectl' "$runtime_cli" 2>/dev/null; then
+        echo "[OK] команда audiorange доступна в системе: $runtime_cli"
+    else
+        echo "[ПРЕДУПРЕЖДЕНИЕ] команда audiorange пока не найдена в системном PATH; основной контроллер доступен внутри модуля"
+        check_warnings=$((check_warnings + 1))
+    fi
+    api="$(ar_android_api)"
+    if ar_android_supported "$api"; then echo "[OK] $(ar_android_name "$api") / API $api входит в диапазон 33–36"; else echo "[ОШИБКА] Android API $api вне диапазона 33–36"; check_failures=$((check_failures + 1)); fi
+    ar_rom_detect
+    echo "[OK] оболочка определена как $AR_ROM_NAME; точность: $(ui_rom_confidence "$AR_ROM_CONFIDENCE")"
+    if ar_audio_probe; then echo "[OK] AudioService доступен через $(ui_backend "$AR_AUDIO_BACKEND" "$AR_AUDIO_CONFIDENCE")"; else echo "[ПРЕДУПРЕЖДЕНИЕ] AudioService сейчас недоступен"; check_warnings=$((check_warnings + 1)); fi
+
+    echo
+    if [ "$check_failures" -eq 0 ]; then
+        ar_state_set integrity VERIFIED
+        echo "Итог: целостность подтверждена."
+        [ "$check_warnings" -eq 0 ] || echo "Предупреждений: $check_warnings."
+        return 0
+    fi
+    ar_state_set integrity MODIFIED
+    echo "Итог: обнаружены изменения или повреждения. Ошибок: $check_failures; предупреждений: $check_warnings."
+    echo "Действие: выполните audiorange fix; при сохранении ошибки переустановите тот же ZIP."
+    return 1
+}
+
+
+cmd_doctor() {
+    load_status
+    failures=0
+    warnings=0
+    check_ok() { echo "[OK] $*"; }
+    check_info() { echo "[ИНФО] $*"; }
+    check_warn() { echo "[ПРЕДУПРЕЖДЕНИЕ] $*"; warnings=$((warnings + 1)); }
+    check_fail() { echo "[ОШИБКА] $*"; failures=$((failures + 1)); }
+
+    echo "Диагностика AudioRange $AR_VERSION"
+    echo
+    api="$(ar_android_api)"
+    if ar_android_supported "$api"; then
+        check_ok "$(ar_android_name "$api") / API $api поддерживается"
+    elif ar_is_uint "$api"; then
+        check_fail "Android API $api не входит в поддерживаемый диапазон 33–36"
+    else
+        check_fail "версию Android API не удалось определить"
+    fi
+    case "$ROOT_MANAGER" in APatch|KernelSU|Magisk) check_ok "root-менеджер: $ROOT_MANAGER" ;; *) check_warn "root-менеджер не определён" ;; esac
+    check_info "оболочка: $ROM_NAME; точность определения: $(ui_rom_confidence "$ROM_CONFIDENCE")"
+    check_info "область модуля: $ROM_SCOPE"
+    check_info "особенности оболочки: $ROM_NOTICE"
+    if ar_is_uint "$COMPAT_KNOWN_MAX"; then
+        check_ok "для точной прошивки известен OEM-предел: $COMPAT_KNOWN_MAX; источник: $(ar_compat_source_text "$COMPAT_SOURCE")"
+    else
+        check_info "OEM-предел этой прошивки неизвестен; каждый профиль подтверждается только после перезагрузки через AudioService"
+    fi
+    [ -n "$COMPAT_CONFIRMED" ] && check_info "подтверждённые значения для этой прошивки: $COMPAT_CONFIRMED"
+    [ -n "$COMPAT_REJECTED" ] && check_info "ранее отклонённые значения для этой прошивки: $COMPAT_REJECTED"
+    if [ "$PROFILE" != "stock" ] && [ "$COMPAT_ACTIVE_STATE" = "blocked" ]; then
+        check_fail "выбранный профиль $EXPECTED выше известного OEM-предела $COMPAT_KNOWN_MAX"
+    fi
+    ar_valid_profile "$PROFILE" && check_ok "профиль корректен: $(ui_profile "$PROFILE" "$CUSTOM")" || check_fail "профиль повреждён"
+    [ -r "$AR_SYSTEM_PROP" ] && check_ok "system.prop доступен для чтения" || check_fail "system.prop отсутствует"
+    [ "$INTEGRITY" = "VERIFIED" ] && check_ok "целостность файлов подтверждена" || check_warn "целостность: $(ui_integrity "$INTEGRITY"); выполните audiorange check"
+    if [ "$PROFILE" = "stock" ]; then
+        case "$EARLY_RESULT:$EARLY_CURRENT" in
+            stock_skipped:1) check_ok "раннее применение не требуется для штатного профиля" ;;
+            *) check_info "раннее применение для штатного профиля не требуется" ;;
+        esac
+    else
+        case "$EARLY_RESULT:$EARLY_CURRENT" in
+            applied:1)
+                if [ "$EARLY_TARGET" = "$EXPECTED" ] && [ "$EARLY_AFTER" = "$EXPECTED" ]; then
+                    check_ok "свойство $EXPECTED применено на ранней стадии до Android-сервисов"
+                else
+                    check_fail "ранний скрипт применил $EARLY_TARGET/$EARLY_AFTER вместо $EXPECTED"
+                fi
+                ;;
+            resetprop_missing:1) check_fail "resetprop недоступен на ранней стадии загрузки" ;;
+            resetprop_failed:1) check_fail "resetprop не смог применить $EXPECTED на ранней стадии" ;;
+            property_mismatch:1) check_fail "после раннего resetprop свойство равно $EARLY_AFTER вместо $EXPECTED" ;;
+            invalid_value:1) check_fail "ранний скрипт отклонил недопустимое значение $EARLY_TARGET" ;;
+            *) check_warn "нет результата раннего применения для текущей загрузки; требуется перезагрузка" ;;
+        esac
+    fi
+    case "$VERIFY" in
+        CONFIRMED) check_ok "системный аудиосервис подтвердил максимум $AUDIO_MAX" ;;
+        STOCK_ACTIVE) check_ok "штатный диапазон активен: $AUDIO_MIN–$AUDIO_MAX" ;;
+        PROPERTY_ONLY) check_warn "свойство совпадает, но диапазон системного аудиосервиса не прочитан" ;;
+        REBOOT_REQUIRED) check_warn "для применения профиля требуется перезагрузка" ;;
+        AUDIOSERVICE_MISMATCH)
+            if [ "$EARLY_RESULT" = "applied" ] && [ "$EARLY_CURRENT" = "1" ] && [ "$EARLY_TARGET" = "$EXPECTED" ]; then
+                check_fail "значение $EXPECTED применено до Android-сервисов, но AudioService вернул максимум $AUDIO_MAX; отклонено именно это значение для текущей прошивки"
+            else
+                check_fail "системный аудиосервис использует $AUDIO_MAX вместо $EXPECTED"
+            fi
+            ;;
+        PROPERTY_MISMATCH) check_fail "свойство Android $PROP не совпадает с $EXPECTED" ;;
+        *) check_warn "результат проверки: $(ui_verification "$VERIFY" "$EXPECTED" "$PROP" "$AUDIO_MIN" "$AUDIO_MAX")" ;;
+    esac
+    case "$BASELINE_STATE" in
+        valid) check_ok "штатный диапазон сохранён: максимум $BASELINE_MAX" ;;
+        stale) check_warn "штатный диапазон устарел после обновления прошивки" ;;
+        *) check_info "штатный диапазон не сохранён; это не мешает работе профиля" ;;
+    esac
+    [ "$CONFLICT_HIGH" -eq 0 ] && check_ok "критических конфликтов нет" || check_fail "найдено критических источников: $CONFLICT_HIGH"
+    [ "$CONFLICT_MEDIUM" -eq 0 ] && check_ok "динамических конфликтов нет" || check_warn "найдено динамических источников: $CONFLICT_MEDIUM"
+    [ "$TEST_ACTIVE" -eq 0 ] && check_ok "безопасный тест не активен" || check_warn "безопасный тест активен, осталось ${TEST_REMAINING} с"
+    [ "$FIRMWARE_CHANGED" -eq 0 ] && check_ok "прошивка совпадает с последней проверенной" || check_warn "после проверки изменилась прошивка"
+    enforcing="$(getenforce 2>/dev/null)"
+    [ "$enforcing" = "Enforcing" ] && check_ok "SELinux: Enforcing" || check_warn "SELinux: ${enforcing:-неизвестно}"
+
+    if [ "$VERIFY" = "AUDIOSERVICE_MISMATCH" ] && [ "$EARLY_RESULT" = "applied" ] && [ "$EARLY_CURRENT" = "1" ] && [ "$EARLY_TARGET" = "$EXPECTED" ]; then
+        if ar_is_uint "$COMPAT_CONFIRMED_MAX"; then
+            doctor_action="выберите audiorange $COMPAT_CONFIRMED_MAX и перезагрузите Android; значение $EXPECTED отклонено этой прошивкой"
+        else
+            doctor_action="выберите audiorange stock и перезагрузите Android; значение $EXPECTED отклонено этой прошивкой"
+        fi
+    elif [ "$PROFILE" != "stock" ] && [ "$EARLY_CURRENT" != "1" ]; then
+        doctor_action="перезагрузите Android для проверки раннего применения"
+    elif [ "$CONFLICT_HIGH" -gt 0 ]; then
+        doctor_action="выполните audiorange conflicts и устраните критический источник"
+    elif [ "$INTEGRITY" != "VERIFIED" ]; then
+        doctor_action="выполните audiorange check"
+    elif [ "$FIRMWARE_CHANGED" -eq 1 ]; then
+        doctor_action="повторно проверьте профиль после обновления прошивки"
+    elif [ "$CONFLICT_MEDIUM" -gt 0 ]; then
+        doctor_action="просмотрите audiorange conflicts и проверьте динамические источники"
+    else
+        doctor_action="$(ui_recommendation "$VERIFY")"
+    fi
+
+    echo
+    if [ "$failures" -gt 0 ]; then
+        echo "Итог: модуль требует внимания. Ошибок: $failures; предупреждений: $warnings."
+        echo "Действие: $doctor_action; затем повторите audiorange doctor."
+        return 1
+    elif [ "$warnings" -gt 0 ]; then
+        echo "Итог: модуль работает с предупреждениями ($warnings)."
+        echo "Действие: $doctor_action."
+    else
+        echo "Итог: модуль работает штатно; действий не требуется."
+    fi
+}
+
+
+cmd_fix() {
+    echo "Безопасное восстановление AudioRange"
+    echo
+    repair_failures=0
+    if [ -d "$AR_LOCK" ]; then
+        if ar_lock_cleanup; then echo "[ИСПРАВЛЕНО] удалена зависшая блокировка"; else echo "[ОШИБКА] конфигурация используется другой операцией"; repair_failures=$((repair_failures + 1)); fi
+    else echo "[OK] зависшей блокировки нет"; fi
+
+    if [ -f "$AR_TEST_STATE" ]; then
+        if ar_recover_test >/dev/null 2>&1; then echo "[ИСПРАВЛЕНО] восстановлена громкость незавершённого теста"; else echo "[ПРЕДУПРЕЖДЕНИЕ] громкость теста пока не удалось восстановить"; fi
+    else echo "[OK] незавершённого теста нет"; fi
+
+    before="$(cat "$AR_CONFIG" 2>/dev/null)"
+    ar_ensure_config
+    ar_compat_prepare
+    after="$(cat "$AR_CONFIG" 2>/dev/null)"
+    [ "$before" = "$after" ] && echo "[OK] конфигурация корректна" || echo "[ИСПРАВЛЕНО] конфигурация нормализована"
+    profile="$(ar_cfg_get profile)"
+    custom="$(ar_cfg_get custom_steps)"
+    if [ "$profile" != "stock" ]; then
+        active_steps="$(ar_profile_steps "$profile" "$custom")"
+        active_state="$(ar_compat_profile_state "$active_steps")"
+        case "$active_state" in
+            blocked|rejected)
+                fallback="$(ar_compat_safe_fallback)"
+                fallback_profile="${fallback%%|*}"
+                fallback_rest="${fallback#*|}"
+                fallback_custom="${fallback_rest%%|*}"
+                fallback_steps="${fallback_rest##*|}"
+                profile="$fallback_profile"
+                custom="$fallback_custom"
+                ar_write_config "$profile" "$custom" 1 "$fallback_steps" "$(ar_cfg_get last_confirmed)" "reboot_required" "$(ar_cfg_get verification_failures)" "$(ar_cfg_get last_verified_build)"
+                echo "[ИСПРАВЛЕНО] несовместимый профиль $active_steps заменён на $(ui_profile "$profile" "$custom")"
+                ;;
+        esac
+    fi
+    expected_prop="$AR_DATA_DIR/.system.prop.fix.$$"
+    ar_system_prop_content "$profile" "$custom" > "$expected_prop"
+    if cmp -s "$expected_prop" "$AR_SYSTEM_PROP" 2>/dev/null; then
+        echo "[OK] system.prop уже соответствует $(ui_profile "$profile" "$custom")"
+        rm -f "$expected_prop"
+    elif mv -f "$expected_prop" "$AR_SYSTEM_PROP" 2>/dev/null; then
+        chmod 0644 "$AR_SYSTEM_PROP" 2>/dev/null
+        echo "[ИСПРАВЛЕНО] system.prop пересоздан для $(ui_profile "$profile" "$custom")"
+    else
+        rm -f "$expected_prop"
+        echo "[ОШИБКА] не удалось пересоздать system.prop"
+        repair_failures=$((repair_failures + 1))
+    fi
+
+    chmod 0755 "$MODDIR/customize.sh" "$MODDIR/post-fs-data.sh" "$MODDIR/service.sh" "$MODDIR/action.sh" "$MODDIR/uninstall.sh" "$MODDIR/bin/audiorangectl" "$MODDIR/system/bin/audiorange" 2>/dev/null
+    chmod 0644 "$MODDIR/common/audiorange-lib.sh" "$MODDIR/system.prop" "$MODDIR/module.prop" "$MODDIR/manifest.sha256" 2>/dev/null
+    chmod 0600 "$AR_CONFIG" "$AR_HISTORY" "$AR_STATE" "$AR_BASELINE" "$AR_TEST_STATE" "$AR_COMPAT" 2>/dev/null
+    if ar_install_cli_wrapper; then :; else echo "[ПРЕДУПРЕЖДЕНИЕ] не удалось установить резервную команду audiorange для KernelSU"; fi
+    find "$MODDIR" "$AR_DATA_DIR" -maxdepth 2 -type f -name '.*.tmp.*' -delete 2>/dev/null
+    echo "[ИСПРАВЛЕНО] права, команда audiorange и временные файлы нормализованы"
+    echo
+
+    check_failures=0
+    if cmd_self_check; then
+        :
+    else
+        remaining="${check_failures:-1}"
+        ar_is_uint "$remaining" || remaining=1
+        [ "$remaining" -gt 0 ] 2>/dev/null || remaining=1
+        repair_failures=$((repair_failures + remaining))
+    fi
+    ar_history "repair completed failures=$repair_failures"
+    echo
+    [ "$repair_failures" -eq 0 ] && { echo "Результат восстановления: успешно."; return 0; }
+    echo "Результат восстановления: остались ошибки ($repair_failures)."
+    return 1
+}
+
+
+cmd_baseline() {
+    ar_ensure_config
+    profile="$(ar_cfg_get profile)"
+    pending="$(ar_cfg_get pending_reboot)"
+    [ "$profile" = "stock" ] || { echo "Ошибка: сначала выберите штатный профиль и перезагрузите Android." >&2; return 2; }
+    [ "$pending" = "0" ] || { echo "Ошибка: перед сохранением штатного диапазона требуется перезагрузка." >&2; return 3; }
+    if ar_capture_baseline; then
+        echo "Штатный диапазон сохранён: $(ar_cfg_get audio_min "$AR_BASELINE")–$(ar_cfg_get audio_max "$AR_BASELINE")."
+        echo "Источник проверки: $(ui_backend "$(ar_cfg_get backend "$AR_BASELINE")" "$(ar_cfg_get confidence "$AR_BASELINE")")."
+    else
+        echo "Ошибка: диапазон AudioService сейчас недоступен." >&2
+        return 4
+    fi
+}
+
+
+cmd_report() {
+    load_status
+    cat <<EOF_REPORT
+AudioRange — технический отчёт (включает fingerprint прошивки, но не данные приложений)
+Версия: $AR_VERSION
+Автор: Lolokeksu
+ID модуля: $AR_MODULE_ID
+Root-менеджер: $ROOT_MANAGER
+Android: $ANDROID_NAME / API $ANDROID_API
+Поддерживаемый диапазон: Android 13–16 / API 33–36
+Устройство: $(getprop ro.product.model) ($(getprop ro.product.device))
+Оболочка: $ROM_NAME
+Версия оболочки: $ROM_VERSION
+Точность определения оболочки: $(ui_rom_confidence "$ROM_CONFIDENCE")
+Область изменения: $ROM_SCOPE
+Вне контроля модуля: $ROM_OUTSIDE
+Примечание оболочки: $ROM_NOTICE
+Сборка: $CURRENT_BUILD
+
+Профиль: $(ui_profile "$PROFILE" "$CUSTOM")
+Настроено шагов: $( [ "$EXPECTED" = "stock" ] && printf "значение прошивки" || printf "%s" "$EXPECTED" )
+Свойство Android: $( [ "$PROP" = "unset" ] && printf "не переопределено" || printf "%s" "$PROP" )
+AudioService: $AUDIO_MIN–$AUDIO_MAX
+Текущий индекс: $AUDIO_CURRENT
+Источник проверки: $(ui_backend "$AUDIO_BACKEND" "$AUDIO_CONFIDENCE")
+Результат: $(ui_verification "$VERIFY" "$EXPECTED" "$PROP" "$AUDIO_MIN" "$AUDIO_MAX")
+Требуется перезагрузка: $(ui_yes_no "$PENDING")
+Неудачных проверок подряд: $FAILURES
+
+Совместимость текущей прошивки:
+Известный OEM-предел: $(ui_compat_limit "$COMPAT_KNOWN_MAX" "$COMPAT_SOURCE")
+Штатный максимум в базе: $COMPAT_STOCK_MAX
+Подтверждённые значения: $(ui_compat_values "$COMPAT_CONFIRMED")
+Отклонённые значения: $(ui_compat_values "$COMPAT_REJECTED")
+Статус активного профиля: $( [ "$PROFILE" = "stock" ] && printf "штатный" || ui_compat_profile_state "$COMPAT_ACTIVE_STATE" )
+Примечание: $COMPAT_NOTE
+
+Штатный диапазон: $(ui_baseline "$BASELINE_STATE" "$BASELINE_MAX")
+Целостность: $(ui_integrity "$INTEGRITY")
+Раннее применение: $(ui_early_apply "$EARLY_RESULT" "$EARLY_TARGET" "$EARLY_CURRENT")
+Результат раннего скрипта: $EARLY_RESULT; target=$EARLY_TARGET; property_after=$EARLY_AFTER; current_boot=$EARLY_CURRENT
+Восстановление теста: $(ui_recovery "$TEST_RECOVERY")
+Активный тест: $(ui_yes_no "$TEST_ACTIVE")
+Конфликты: критические=$CONFLICT_HIGH, динамические=$CONFLICT_MEDIUM, совпадения=$CONFLICT_LOW
+Прошивка изменилась: $(ui_yes_no "$FIRMWARE_CHANGED")
+SELinux: $(getenforce 2>/dev/null)
+EOF_REPORT
+}
+
+
+cmd_boot_verify() {
+    ar_recover_test >/dev/null 2>&1 || true
+    ar_lock_acquire || return 1
+    trap 'ar_lock_release' EXIT INT TERM
+    ar_ensure_config
+    profile="$(ar_cfg_get profile)"
+    custom="$(ar_cfg_get custom_steps)"
+    last_applied="$(ar_cfg_get last_applied)"
+    last_confirmed="$(ar_cfg_get last_confirmed)"
+    failures="$(ar_cfg_get verification_failures)"
+    previous_build="$(ar_cfg_get last_verified_build)"
+    prop="$(ar_prop_value)"
+    if ar_audio_probe; then max="$AR_AUDIO_MAX"; else max="unknown"; fi
+    if [ "$profile" = "stock" ]; then pending=0; else expected="$(ar_profile_steps "$profile" "$custom")"; [ "$prop" = "$expected" ] && pending=0 || pending=1; fi
+    result="$(ar_verification "$profile" "$custom" "$pending" "$prop" "$max")"
+    case "$result" in
+        CONFIRMED|STOCK_ACTIVE) failures=0; verified_build="$(ar_build_id)" ;;
+        PROPERTY_MISMATCH|AUDIOSERVICE_MISMATCH) ar_is_uint "$failures" || failures=0; failures=$((failures + 1)); verified_build="$previous_build" ;;
+        *) verified_build="$previous_build" ;;
+    esac
+    if [ "$profile" = "stock" ] && [ "$result" = "STOCK_ACTIVE" ] && ar_is_uint "$max"; then
+        ar_compat_record_stock "$max" >/dev/null 2>&1 || true
+    elif [ "$result" = "CONFIRMED" ]; then
+        expected="$(ar_profile_steps "$profile" "$custom")"
+        last_confirmed="$max"
+        ar_compat_record_result "$expected" "$max" confirmed >/dev/null 2>&1 || true
+    elif [ "$result" = "AUDIOSERVICE_MISMATCH" ]; then
+        expected="$(ar_profile_steps "$profile" "$custom")"
+        early_result="$(ar_early_get result)"
+        early_target="$(ar_early_get target)"
+        early_boot="$(ar_early_get boot_id)"
+        if [ "$prop" = "$expected" ] && [ "$early_result" = "applied" ] && [ "$early_target" = "$expected" ] && [ "$early_boot" = "$(ar_boot_id)" ]; then
+            ar_compat_record_result "$expected" "$max" rejected >/dev/null 2>&1 || true
+        fi
+    fi
+    [ -n "$last_confirmed" ] || last_confirmed="unknown"
+    [ -n "$verified_build" ] || verified_build="unknown"
+    ar_write_config "$profile" "$custom" "$pending" "$last_applied" "$last_confirmed" "$result" "$failures" "$verified_build"
+    if [ "$profile" = "stock" ] && [ "$result" = "STOCK_ACTIVE" ]; then
+        state="$(ar_baseline_state)"
+        [ "$state" = "valid" ] || ar_capture_baseline >/dev/null 2>&1
+    fi
+    tmp="$AR_DATA_DIR/.conflicts.boot.$$"
+    ar_conflicts_scan > "$tmp"; rm -f "$tmp"
+    ar_update_description "$result" "$profile" "$(ar_profile_steps "$profile" "$custom")" "${AR_CONFLICT_COUNT:-0}"
+    ar_history "boot profile=$profile property=$prop audio_max=$max backend=${AR_AUDIO_BACKEND:-unavailable} result=$result failures=$failures conflicts=${AR_CONFLICT_COUNT:-0}"
+    ar_lock_release
+    trap - EXIT INT TERM
+    echo "$result"
+}
+
+cmd_test_guard() {
+    token="$1"
+    sleep 90
+    [ -f "$AR_TEST_STATE" ] || return 0
+    saved_token="$(ar_cfg_get token "$AR_TEST_STATE")"
+    [ "$saved_token" = "$token" ] || return 0
+    original="$(ar_cfg_get original "$AR_TEST_STATE")"
+    if ar_is_uint "$original"; then ar_audio_set "$original"; ar_history "volume_test auto_restore index=$original"; fi
+    rm -f "$AR_TEST_STATE"
+}
+
+cmd_test_begin() {
+    ar_init_dirs
+    [ -f "$AR_TEST_STATE" ] && ar_recover_test >/dev/null 2>&1
+    ar_audio_probe || { echo "Ошибка: диапазон AudioService сейчас недоступен." >&2; return 1; }
+    token="$(ar_epoch)-$$"
+    expires=$(( $(ar_epoch) + 90 ))
+    ar_atomic_from_stdin "$AR_TEST_STATE" 0600 <<EOF_TEST
+active=1
+token=$token
+original=$AR_AUDIO_CURRENT
+minimum=$AR_AUDIO_MIN
+maximum=$AR_AUDIO_MAX
+expires=$expires
+EOF_TEST
+    ar_history "volume_test begin original=$AR_AUDIO_CURRENT max=$AR_AUDIO_MAX timeout=90s"
+    "$MODDIR/bin/audiorangectl" test-guard "$token" >/dev/null 2>&1 &
+    echo "Тест начат. Исходный индекс: $AR_AUDIO_CURRENT из $AR_AUDIO_MAX. Автовосстановление: 90 секунд."
+}
+
+cmd_test_set() {
+    percent="$1"
+    ar_is_uint "$percent" || { echo "Ошибка: процент должен быть целым числом." >&2; return 2; }
+    [ "$percent" -ge 0 ] 2>/dev/null && [ "$percent" -le 50 ] 2>/dev/null || { echo "Ошибка: безопасный диапазон теста — от 0 до 50%." >&2; return 2; }
+    [ -f "$AR_TEST_STATE" ] || { echo "Ошибка: сначала запустите тест." >&2; return 3; }
+    expires="$(ar_cfg_get expires "$AR_TEST_STATE")"; now="$(ar_epoch)"
+    if ar_is_uint "$expires" && ar_is_uint "$now" && [ "$now" -gt "$expires" ]; then cmd_test_restore >/dev/null 2>&1; echo "Ошибка: время тестовой сессии истекло." >&2; return 3; fi
+    max="$(ar_cfg_get maximum "$AR_TEST_STATE")"; min="$(ar_cfg_get minimum "$AR_TEST_STATE")"
+    ar_is_uint "$max" || return 3; ar_is_uint "$min" || min=0
+    target=$(( (max * percent + 50) / 100 )); [ "$target" -ge "$min" ] || target="$min"
+    ar_audio_set "$target" || { echo "Ошибка: AudioService отклонил индекс $target." >&2; return 4; }
+    ar_history "volume_test set percent=$percent index=$target max=$max"
+    echo "Тестовый уровень: $target из $max ($percent%)."
+}
+
+cmd_test_quick() {
+    percent="$1"
+    ar_is_uint "$percent" || { echo "Ошибка: тестовое значение должно быть от 0 до 50%." >&2; return 2; }
+    [ "$percent" -ge 0 ] 2>/dev/null && [ "$percent" -le 50 ] 2>/dev/null || { echo "Ошибка: безопасный диапазон теста — от 0 до 50%." >&2; return 2; }
+    [ -f "$AR_TEST_STATE" ] && cmd_test_restore >/dev/null 2>&1
+    cmd_test_begin || return $?
+    cmd_test_set "$percent" || { cmd_test_restore >/dev/null 2>&1; return 1; }
+    echo "Автовосстановление остаётся активным в течение 90 секунд."
+}
+
+cmd_test_restore() {
+    [ -f "$AR_TEST_STATE" ] || { echo "Активной тестовой сессии нет."; return 0; }
+    original="$(ar_cfg_get original "$AR_TEST_STATE")"
+    if ar_is_uint "$original"; then ar_audio_set "$original" || { echo "Ошибка: не удалось восстановить индекс $original." >&2; return 1; }; ar_history "volume_test restore index=$original"; fi
+    rm -f "$AR_TEST_STATE"
+    echo "Исходная громкость восстановлена: $original."
+}
+
+case "${1:-}" in
+    ''|status|s) cmd_status ;;
+    web-status) cmd_web_status ;;
+    doctor|d) cmd_doctor ;;
+    self-check|check|c) cmd_self_check ;;
+    fix|f) cmd_fix ;;
+    report|p) cmd_report ;;
+    baseline|b) cmd_baseline ;;
+    history|h) cmd_history "${2:-20}" ;;
+    conflicts|x) cmd_conflicts ;;
+    stock|30|50|75|100) cmd_set "$1" ;;
+    custom) [ -n "${2:-}" ] || { echo "Ошибка: пользовательское значение должно быть от $AR_CUSTOM_MIN до $AR_CUSTOM_MAX." >&2; exit 2; }; cmd_set custom "$2" ;;
+    set) [ -n "${2:-}" ] || { usage; exit 2; }; cmd_set "$2" "${3:-}" ;;
+    boot-verify) cmd_boot_verify ;;
+    recover-test) ar_recover_test ;;
+    restore|r) cmd_test_restore ;;
+    test|t)
+        case "${2:-}" in begin) cmd_test_begin ;; set) cmd_test_set "${3:-}" ;; restore) cmd_test_restore ;; '') echo "Ошибка: укажите безопасный уровень теста от 0 до 50%." >&2; exit 2 ;; *) cmd_test_quick "$2" ;; esac
+        ;;
+    test-guard) cmd_test_guard "${2:-}" ;;
+    help|-h|--help) usage ;;
+    *) if ar_valid_custom "$1"; then cmd_set custom "$1"; else echo "Ошибка: неизвестная команда или значение: $1" >&2; usage; exit 2; fi ;;
+esac

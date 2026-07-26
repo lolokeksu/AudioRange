@@ -1,0 +1,11 @@
+id=audiorange
+name=AudioRange
+version=v1.0.0-beta.1
+versionCode=100001
+author=Lolokeksu
+description=Beta: адаптивный диапазон STREAM_MUSIC с проверкой реального максимума AudioService | API 33–36
+updateJson=https://raw.githubusercontent.com/lolokeksu/AudioRange/main/update.json
+banner=banner.png
+webicon=webicon.png
+webuiIcon=webicon.png
+actionIcon=webicon.png

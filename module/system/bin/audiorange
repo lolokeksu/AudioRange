@@ -1,0 +1,11 @@
+#!/system/bin/sh
+# AudioRange managed systemless wrapper
+
+CTL="/data/adb/modules/audiorange/bin/audiorangectl"
+
+if [ ! -x "$CTL" ]; then
+    echo "Ошибка: контроллер AudioRange недоступен." >&2
+    exit 1
+fi
+
+exec "$CTL" "$@"

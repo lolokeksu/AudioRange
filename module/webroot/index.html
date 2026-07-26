@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0e14">
+  <title>AudioRange</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero compact-hero">
+      <div>
+        <p class="eyebrow">LOLOKEKSU · SYSTEMLESS</p>
+        <h1>AudioRange</h1>
+        <p class="subtitle">Логическая шкала мультимедиа с проверкой реального диапазона AudioService.</p>
+      </div>
+      <div id="statusBadge" class="badge neutral" role="status">Проверка…</div>
+    </header>
+
+    <section id="bridgeWarning" class="notice danger hidden" role="alert">
+      Системный мост APatch или KernelSU недоступен. Интерфейс можно просмотреть, но управлять модулем нельзя.
+    </section>
+    <section id="rebootNotice" class="notice warning hidden">
+      Профиль сохранён, но Android продолжает использовать предыдущий диапазон.
+      <button id="rebootButton" class="link-button">Перезагрузить</button>
+    </section>
+    <section id="firmwareNotice" class="notice warning hidden">
+      Прошивка изменилась. Результаты совместимости сброшены; повторите диагностику.
+    </section>
+    <section id="testNotice" class="notice warning hidden">
+      Безопасный тест активен. Исходная громкость вернётся через <strong id="testCountdown">—</strong> с.
+    </section>
+
+    <nav class="view-tabs" role="tablist" aria-label="Разделы WebUI">
+      <button id="tabControl" class="view-tab active" data-view-target="control" role="tab" aria-controls="viewControl" aria-selected="true" tabindex="0">Управление</button>
+      <button id="tabDiagnostics" class="view-tab" data-view-target="diagnostics" role="tab" aria-controls="viewDiagnostics" aria-selected="false" tabindex="-1">Диагностика</button>
+      <button id="tabTest" class="view-tab" data-view-target="test" role="tab" aria-controls="viewTest" aria-selected="false" tabindex="-1">Тест</button>
+    </nav>
+
+    <div class="view-stack">
+      <section id="viewControl" class="view active" data-view="control" role="tabpanel" aria-labelledby="tabControl">
+        <section class="card status-card compact-status">
+          <div class="section-head tight-head">
+            <div><p class="eyebrow">СОСТОЯНИЕ</p><h2>Текущий результат</h2></div>
+            <button id="refreshButton" class="icon-button" aria-label="Обновить состояние" title="Обновить состояние">↻</button>
+          </div>
+          <div class="result-panel">
+            <strong id="verificationText">Получение данных…</strong>
+            <small id="verificationAction">—</small>
+          </div>
+          <div class="quick-metrics" aria-label="Основные показатели">
+            <article><span>Профиль</span><strong id="metricProfile">—</strong></article>
+            <article><span>AudioService</span><strong id="metricRange">—</strong></article>
+            <article><span>OEM-предел</span><strong id="compatLimit">—</strong><small id="compatSource">—</small></article>
+            <article><span>Штатно</span><strong id="metricBaseline">—</strong></article>
+          </div>
+        </section>
+
+        <section class="card profile-card">
+          <div class="section-head tight-head">
+            <div><p class="eyebrow">ПРОФИЛЬ</p><h2>Выбор шкалы</h2></div>
+          </div>
+          <div class="selection-summary compact-summary">
+            <div><span>Сохранено</span><strong id="currentSelection">—</strong></div>
+            <div><span>К применению</span><strong id="pendingSelection">—</strong></div>
+          </div>
+          <div class="profile-grid compact-profiles">
+            <button data-profile="stock"><strong>Штатный</strong><small>Без переопределения</small></button>
+            <button data-profile="30"><strong>30</strong><em data-profile-state="30">Не проверено</em></button>
+            <button data-profile="50"><strong>50</strong><em data-profile-state="50">Не проверено</em></button>
+            <button data-profile="75"><strong>75</strong><em data-profile-state="75">Не проверено</em></button>
+            <button data-profile="100"><strong>100</strong><em data-profile-state="100">Не проверено</em></button>
+            <button data-profile="custom"><strong>Свой</strong><small>15–100</small></button>
+          </div>
+          <div id="customRow" class="custom-row hidden">
+            <label for="customInput">Количество шагов</label>
+            <input id="customInput" type="number" min="15" max="100" step="1" inputmode="numeric" value="60">
+          </div>
+          <p id="profileExplanation" class="profile-explanation compact-explanation">Штатный профиль сохраняет поведение прошивки.</p>
+          <button id="applyButton" class="primary wide">Выберите профиль</button>
+          <p class="fineprint">Изменяется число логических уровней, а не максимальная громкость. После смены профиля потребуется перезагрузка.</p>
+        </section>
+      </section>
+
+      <section id="viewDiagnostics" class="view" data-view="diagnostics" role="tabpanel" aria-labelledby="tabDiagnostics" hidden>
+        <section class="card action-card">
+          <div class="section-head tight-head"><div><p class="eyebrow">ИНСТРУМЕНТЫ</p><h2>Проверка и обслуживание</h2></div></div>
+          <div class="action-grid">
+            <button id="doctorButton" class="secondary">Диагностика</button>
+            <button id="selfCheckButton" class="secondary">Целостность</button>
+            <button id="fixButton" class="secondary">Исправить</button>
+            <button id="conflictsButton" class="secondary">Конфликты</button>
+            <button id="baselineButton" class="secondary">Штатный диапазон</button>
+            <button id="reportButton" class="secondary">Скопировать отчёт</button>
+          </div>
+        </section>
+
+        <details class="card disclosure" open>
+          <summary><span><small>СОВМЕСТИМОСТЬ</small><strong>Текущая прошивка</strong></span><i>⌄</i></summary>
+          <div class="disclosure-body">
+            <div class="verification-row"><span>Штатный максимум</span><strong id="compatStock">—</strong></div>
+            <div class="verification-row"><span>Подтверждено AudioService</span><strong id="compatConfirmed">—</strong></div>
+            <div class="verification-row"><span>Отклонено прошивкой</span><strong id="compatRejected">—</strong></div>
+            <p id="compatNote" class="profile-explanation compact-explanation">Результаты относятся только к текущему fingerprint.</p>
+          </div>
+        </details>
+
+        <details class="card disclosure">
+          <summary><span><small>СИСТЕМА</small><strong>Техническое состояние</strong></span><i>⌄</i></summary>
+          <div class="disclosure-body">
+            <div class="verification-row"><span>Свойство Android</span><strong id="metricProperty">—</strong></div>
+            <div class="verification-row"><span>Оболочка</span><strong id="metricRom">—</strong></div>
+            <div class="verification-row"><span>Root-менеджер</span><strong id="rootManager">—</strong></div>
+            <div class="verification-row"><span>Устройство и Android</span><strong id="deviceName">—</strong></div>
+            <div class="verification-row"><span>Метод проверки</span><strong id="backendText">—</strong></div>
+            <div class="verification-row"><span>Целостность файлов</span><strong id="integrityText">—</strong></div>
+            <div class="verification-row"><span>Источники конфликтов</span><strong id="conflictCount">—</strong></div>
+            <div class="verification-row"><span>Восстановление теста</span><strong id="testRecovery">—</strong></div>
+          </div>
+        </details>
+
+        <details class="card disclosure">
+          <summary><span><small>ОБОЛОЧКА</small><strong>Границы воздействия</strong></span><i>⌄</i></summary>
+          <div class="disclosure-body">
+            <div class="result-panel compact-panel">
+              <strong id="romName">—</strong>
+              <small id="romConfidence">—</small>
+            </div>
+            <div class="verification-row"><span>Изменяется модулем</span><strong id="romScope">—</strong></div>
+            <div class="verification-row"><span>Контролируется прошивкой</span><strong id="romOutside">—</strong></div>
+            <p id="romNotice" class="profile-explanation compact-explanation">Получение данных…</p>
+          </div>
+        </details>
+      </section>
+
+      <section id="viewTest" class="view" data-view="test" role="tabpanel" aria-labelledby="tabTest" hidden>
+        <section class="card test-card">
+          <div class="section-head tight-head"><div><p class="eyebrow">БЕЗОПАСНЫЙ ТЕСТ</p><h2>Проверка активной шкалы</h2></div></div>
+          <p class="compact-copy">Тест не воспроизводит звук и не меняет профиль. Он временно устанавливает текущий индекс в пределах уже активной шкалы, максимум до 50%.</p>
+          <div class="test-status-line"><span>Порядок</span><strong>Начать → выбрать уровень → восстановить</strong></div>
+          <div class="test-actions">
+            <button id="testBegin" class="secondary">Начать</button>
+            <button data-test-percent="10" class="test-control" disabled>10%</button>
+            <button data-test-percent="25" class="test-control" disabled>25%</button>
+            <button data-test-percent="50" class="test-control" disabled>50%</button>
+            <button id="testRestore" class="danger-button" disabled>Восстановить</button>
+          </div>
+        </section>
+      </section>
+    </div>
+
+    <details id="consoleDrawer" class="console-drawer">
+      <summary>
+        <span><small>ЖУРНАЛ</small><strong>Последняя операция</strong></span>
+        <span class="console-actions"><i aria-hidden="true">⌃</i></span>
+      </summary>
+      <div class="console-toolbar"><button id="historyButton" class="secondary compact" type="button">Показать историю</button></div>
+      <pre id="console" aria-live="polite" aria-atomic="true">Получение состояния модуля…</pre>
+    </details>
+
+    <footer>AudioRange v1.0.0-beta.1 Beta · Lolokeksu · API 33–36 · локальный WebUI</footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

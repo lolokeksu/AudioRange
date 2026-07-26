@@ -1,0 +1,49 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y busybox file nodejs python3 zip
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version=//p' module/module.prop | head -n 1)"
+          version_code="$(sed -n 's/^versionCode=//p' module/module.prop | head -n 1)"
+          test -n "$version" && test -n "$version_code"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then test "$GITHUB_REF_NAME" = "$version"; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: ./scripts/test.sh
+      - name: Build
+        run: ./scripts/build.sh
+      - name: Verify
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; leaving it immutable."
+            exit 0
+          fi
+          notes="docs/GITHUB_RELEASE_${VERSION}.md"
+          test -f "$notes" || notes="CHANGELOG.md"
+          gh release create "$VERSION"             "dist/AudioRange-$VERSION.zip"             "dist/AudioRange-$VERSION-source.zip"             dist/SHA256SUMS             --repo "$GITHUB_REPOSITORY"             --target "$GITHUB_SHA"             --title "AudioRange $VERSION"             --notes-file "$notes"             --prerelease
